@@ -122,8 +122,6 @@ func (s *Server) reconnect() error {
 }
 
 func (s *Server) serveCall(ctx context.Context, d *amqp.Delivery) {
-	defer s.ack(d, false)
-
 	ctx = otel.GetTextMapPropagator().Extract(ctx, rmqrpc.TableCarrier(d.Headers))
 
 	ctx, span := otel.Tracer(_tracerName).Start(
@@ -137,6 +135,7 @@ func (s *Server) serveCall(ctx context.Context, d *amqp.Delivery) {
 	if !ok {
 		span.SetStatus(codes.Error, rmqrpc.ErrBadHandler.Error())
 		s.publish(d, nil, rmqrpc.ErrBadHandler.Error())
+		s.ack(d, false)
 
 		return
 	}
@@ -145,9 +144,18 @@ func (s *Server) serveCall(ctx context.Context, d *amqp.Delivery) {
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
-		s.publish(d, nil, rmqrpc.ErrInternalServer.Error())
 
+		// Handler was interrupted by shutdown, not a real failure: requeue
+		// instead of acking, so another instance can redeliver and retry it.
+		if errors.Is(err, context.Canceled) {
+			s.nack(d, false, true)
+
+			return
+		}
+
+		s.publish(d, nil, rmqrpc.ErrInternalServer.Error())
 		s.logger.Error(err, "rmq_rpc server - Server - serveCall - callHandler")
+		s.ack(d, false)
 
 		return
 	}
@@ -158,12 +166,20 @@ func (s *Server) serveCall(ctx context.Context, d *amqp.Delivery) {
 	}
 
 	s.publish(d, body, rmqrpc.Success)
+	s.ack(d, false)
 }
 
 func (s *Server) ack(d *amqp.Delivery, multiple bool) {
 	err := d.Ack(multiple)
 	if err != nil {
 		s.logger.Error(err, "rmq_rpc server - Server - ack - d.Ack")
+	}
+}
+
+func (s *Server) nack(d *amqp.Delivery, multiple, requeue bool) {
+	err := d.Nack(multiple, requeue)
+	if err != nil {
+		s.logger.Error(err, "rmq_rpc server - Server - nack - d.Nack")
 	}
 }
 
